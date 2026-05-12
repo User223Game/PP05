@@ -1,0 +1,143 @@
+2.1.1 VIEW v_appointments_full — Полная информация о записях с JOIN
+
+
+
+CREATE OR REPLACE VIEW v_appointments_full AS
+SELECT
+    a.appointment_id,
+    c.full_name AS client_name,
+    u.full_name AS master_name,
+    a.appointment_time,
+    a.status,
+    STRING_AGG(s.name, ', ' ORDER BY s.name) AS services_list,
+    SUM(COALESCE(aps.price_at_time, s.price) * aps.quantity) AS total_price
+FROM appointments a
+JOIN clients c ON a.client_id = c.client_id
+JOIN users u ON a.master_id = u.user_id
+LEFT JOIN appointment_services aps ON a.appointment_id = aps.appointment_id
+LEFT JOIN services s ON aps.service_id = s.service_id
+GROUP BY a.appointment_id, c.full_name, u.full_name, a.appointment_time, a.status
+ORDER BY a.appointment_time DESC;
+Проверка:
+
+
+SELECT * FROM v_appointments_full ORDER BY appointment_time DESC;
+
+
+Показывает количество записей каждого мастера по статусам. Используется для статистики.
+
+
+CREATE OR REPLACE VIEW v_master_workload AS
+SELECT
+    u.user_id,
+    u.full_name AS master_name,
+    COUNT(CASE WHEN a.status = 'запланирована' THEN 1 END) AS planned_count,
+    COUNT(CASE WHEN a.status = 'выполнена' THEN 1 END) AS completed_count,
+    COUNT(CASE WHEN a.status = 'отменена' THEN 1 END) AS cancelled_count
+FROM users u
+LEFT JOIN appointments a ON u.user_id = a.master_id
+WHERE u.role_id = (SELECT role_id FROM roles WHERE role_name = 'master')
+GROUP BY u.user_id, u.full_name;
+Проверка:
+
+sql
+SELECT * FROM v_master_workload;
+
+
+2.2 Хранимые процедуры
+2.2.1 Процедура sp_change_appointment_status — Смена статуса записи Меняет статус и записывает изменение в appointment_history.
+
+sql
+CREATE OR REPLACE FUNCTION sp_change_appointment_status(
+    p_appointment_id INT,
+    p_new_status VARCHAR(30),
+    p_user_id INT,
+    p_note TEXT DEFAULT NULL
+)
+RETURNS VOID
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_old_status VARCHAR(30);
+BEGIN
+    -- Получить текущий статус
+    SELECT status INTO v_old_status
+    FROM appointments
+    WHERE appointment_id = p_appointment_id;
+
+    -- Обновить статус
+    UPDATE appointments
+    SET status = p_new_status,
+        updated_at = NOW()
+    WHERE appointment_id = p_appointment_id;
+
+    -- Записать историю
+    INSERT INTO appointment_history (appointment_id, changed_by, old_status, new_status, note)
+    VALUES (p_appointment_id, p_user_id, v_old_status, p_new_status, p_note);
+END;
+$$;
+Вызов:
+
+sql
+SELECT sp_change_appointment_status(1, 'выполнена', 2, 'Клиент доволен');
+
+2.2.2 Процедура sp_cancel_appointment — Отмена записи
+
+Отменяет запись. В отличие от общей смены статуса, она дополнительно освобождает время мастера (просто меняет статус на 'отменена').
+
+sql
+CREATE OR REPLACE FUNCTION sp_cancel_appointment(
+    p_appointment_id INT,
+    p_user_id INT,
+    p_note TEXT DEFAULT 'Отменена'
+)
+RETURNS VOID
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    -- Проверим, что запись существует и не отменена ранее
+    IF NOT EXISTS (SELECT 1 FROM appointments WHERE appointment_id = p_appointment_id) THEN
+        RAISE EXCEPTION 'Запись с ID % не найдена', p_appointment_id;
+    END IF;
+    
+    -- Вызовем функцию смены статуса
+    PERFORM sp_change_appointment_status(p_appointment_id, 'отменена', p_user_id, p_note);
+END;
+$$;
+Вызов:
+
+sql
+SELECT sp_cancel_appointment(2, 1, 'Клиент перезвонил и отказался');
+2.2.3 Процедура sp_register_user — Регистрация нового сотрудника
+
+Принимает логин, хэш пароля и личные данные. Добавляет запись в users.
+
+sql
+CREATE OR REPLACE FUNCTION sp_register_user(
+    p_login VARCHAR(80),
+    p_password_hash VARCHAR(64),
+    p_full_name VARCHAR(150),
+    p_email VARCHAR(150),
+    p_role_id INT
+)
+RETURNS VOID
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    -- Проверка уникальности логина
+    IF EXISTS (SELECT 1 FROM users WHERE login = p_login) THEN
+        RAISE EXCEPTION 'Логин уже занят';
+    END IF;
+    -- Проверка уникальности email (если не NULL)
+    IF p_email IS NOT NULL AND EXISTS (SELECT 1 FROM users WHERE email = p_email) THEN
+        RAISE EXCEPTION 'Email уже зарегистрирован';
+    END IF;
+    
+    INSERT INTO users (login, password_hash, full_name, email, role_id, is_active, created_at)
+    VALUES (p_login, p_password_hash, p_full_name, p_email, p_role_id, TRUE, NOW());
+END;
+$$;
+Вызов (пока с заглушкой пароля):
+
+sql
+SELECT sp_register_user('master3', 'temp_hash', 'Дарья Козлова', 'darya@example.com', 2);
